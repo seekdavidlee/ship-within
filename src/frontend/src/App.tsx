@@ -165,9 +165,10 @@ export default function App() {
 
   function archive() {
     const unknown = [state.run, ...state.history.map(item => item.run)].some(run => run?.usage === 'unknown' && !run.usageReconciliation);
-    if (!window.confirm(unknown
+    const warning = dirty ? ' Unsaved kickoff changes will be lost.' : '';
+    if ((Boolean(state.draft) || dirty || unknown) && !window.confirm((unknown
       ? 'Before another planning attempt, check prior AI Credit usage outside this app. Have you reconciled the unknown usage and chosen to record that decision with the archived attempt? The USD budget is not enforced.'
-      : 'Archive this kickoff and start a new one? Previous attempts remain in local history.')) return;
+      : 'Archive this kickoff and start a new one? Previous attempts remain in local history.') + warning)) return;
     void execute(async () => {
       const next = await api('/api/new', 'POST', unknown ? { reconcileUsage: true } : undefined);
       const url = new URL(window.location.href);
@@ -235,7 +236,7 @@ export default function App() {
     <main>
       <div className={`workspace${detailsRepository ? '' : ' first-visit'}`}>
         <section aria-labelledby="kickoff-title">
-          <div className="section-head"><h2 id="kickoff-title">{detailsRepository ? 'Repository details' : 'Kickoff'}</h2><span>{dirty ? 'Unsaved changes' : state.draft ? `Revision ${state.draft.revision}` : 'Not saved'}</span></div>
+          <div className="section-head"><h2 id="kickoff-title">{detailsRepository ? <button className="repository-reference" type="button" disabled={busy || state.run?.status === 'running' || state.run?.status === 'stopping'} onClick={archive} title="Choose a new repository">{detailsRepository}</button> : 'Kickoff'}</h2><span>{dirty ? 'Unsaved changes' : state.draft ? `Revision ${state.draft.revision}` : 'Not saved'}</span></div>
           <form onSubmit={save}>
             <fieldset disabled={used || busy} className="field-grid">
               {!detailsRepository ? <><div className="wide">
@@ -264,7 +265,7 @@ export default function App() {
                 {choosingManually && <div className="owner-search"><input required maxLength={120} aria-label="Repository owner/name" value={draft.repository} onChange={event => setDraft(current => ({ ...current, repository: event.target.value }))} placeholder="owner/repository" autoComplete="off" /><button className="btn" type="button" disabled={busy || !validRepository(draft.repository)} onClick={() => selectRepository(draft.repository)}>Select</button></div>}
                 {repositoryError && <span className="field-hint" role="status">{repositoryError} <button type="button" className="retry" disabled={repositoryLoading} onClick={() => void loadRepositories(owner)}>Retry</button></span>}
               </label>
-              </> : <div className="wide"><span className="field-label">Repository</span><a className="repository-reference" href={`https://github.com/${detailsRepository}`} target="_blank" rel="noreferrer">{detailsRepository}</a></div>}
+              </> : null}
               {detailsRepository && <>
               <label className="wide">Objective <textarea required maxLength={2000} value={draft.objective} onChange={event => change('objective', event.target.value)} placeholder="What should be prioritized?" /></label>
               <label className="wide">Acceptance criteria <textarea required maxLength={2000} value={draft.criteria} onChange={event => change('criteria', event.target.value)} placeholder="What should a useful ranking account for?" /></label>
