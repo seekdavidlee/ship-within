@@ -26,10 +26,66 @@ public sealed class WorkflowTests : IDisposable
 
     private static object DraftInput(string objective = "Order defects and features") => new
     {
-        repository = "team/product", objective, criteria = "Customer blockers", budgetUsd = 10,
+        repository = "team/product", objective, criteria = "Customer blockers",
         planningCredits = 2, deadline = DateTimeOffset.UtcNow.AddMinutes(2).ToString("O"), model = "gpt-4.1",
         candidates = new[] { new { title = "Sign-in fails", kind = "defect", source = "manual", body = "Cannot sign in" } }
     };
+
+    [Theory]
+    [InlineData(1, 0.01)]
+    [InlineData(2, 0.02)]
+    [InlineData(100, 1.00)]
+    public void GivenCreditAllocation_WhenSaving_ReportsDerivedUsd(int credits, double expectedUsd)
+    {
+        var input = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(Input(DraftInput()).GetRawText())!;
+        input["planningCredits"] = Input(credits);
+        var saved = sut.Save(Input(input));
+        var reported = JsonSerializer.SerializeToElement(saved.Draft, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Equal((decimal)expectedUsd, saved.Draft!.EstimatedCostUsd);
+        Assert.Equal((decimal)expectedUsd, reported.GetProperty("estimatedCostUsd").GetDecimal());
+        Assert.False(reported.TryGetProperty("budgetUsd", out _));
+        var reloaded = new Workflow(Path.Combine(directory, "workspace.json"), agent);
+        Assert.Equal((decimal)expectedUsd, reloaded.Snapshot().Draft!.EstimatedCostUsd);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("101")]
+    [InlineData("1.5")]
+    [InlineData("")]
+    public void GivenInvalidCredits_WhenSaving_RejectsAllocation(string credits)
+    {
+        var input = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(Input(DraftInput()).GetRawText())!;
+        input["planningCredits"] = Input(credits);
+
+        Assert.Equal("Planning credits must be from 1 to 100.", Assert.Throws<WorkflowException>(() => sut.Save(Input(input))).Message);
+        Assert.Null(sut.Snapshot().Draft);
+    }
+
+    [Fact]
+    public void GivenLegacyUsdBudgets_WhenReloading_ReportsFromCredits()
+    {
+        sut.Save(Input(DraftInput()));
+        sut.New(default);
+        var saved = sut.Save(Input(DraftInput()));
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var legacy = JsonSerializer.SerializeToNode(saved, options)!;
+        legacy["draft"]!["budgetUsd"] = 999;
+        legacy["draft"]!.AsObject().Remove("estimatedCostUsd");
+        legacy["history"]![0]!["draft"]!["budgetUsd"] = 10;
+        legacy["history"]![0]!["draft"]!.AsObject().Remove("estimatedCostUsd");
+        var file = Path.Combine(directory, "workspace.json");
+        File.WriteAllText(file, legacy.ToJsonString());
+
+        var reloaded = new Workflow(file, agent).Snapshot();
+
+        Assert.Equal(0.02m, reloaded.Draft!.EstimatedCostUsd);
+        Assert.Equal(0.02m, Assert.Single(reloaded.History).Draft.EstimatedCostUsd);
+        var reported = JsonSerializer.SerializeToElement(reloaded, options);
+        Assert.False(reported.GetProperty("draft").TryGetProperty("budgetUsd", out _));
+        Assert.False(reported.GetProperty("history")[0].GetProperty("draft").TryGetProperty("budgetUsd", out _));
+    }
 
     [Fact]
     public void GivenSelectedRepository_WhenReloadingAndSaving_KeepsBindingUntilNewKickoff()
@@ -50,9 +106,13 @@ public sealed class WorkflowTests : IDisposable
     }
 
     [Fact]
-    public void GivenInvalidDraft_WhenSaving_RejectsObjective()
+    public void GivenNoObjective_WhenSaving_PreservesRepositoryAndLimits()
     {
-        Assert.Throws<WorkflowException>(() => sut.Save(Input(DraftInput(""))));
+        var saved = sut.Save(Input(DraftInput("")));
+
+        Assert.Equal("team/product", saved.Draft!.Repository);
+        Assert.Equal("", saved.Draft.Objective);
+        Assert.Equal(2, saved.Draft.PlanningCredits);
     }
 
     [Fact]
@@ -102,6 +162,38 @@ public sealed class WorkflowTests : IDisposable
         Assert.Equal("gpt-4.1", reloaded.Snapshot().AgentModels!["productOwner"]);
         Assert.Equal("team/product", reloaded.Snapshot().Repository);
         Assert.Equal(409, Assert.Throws<WorkflowException>(() => reloaded.SelectRepository(Input(new { repository = "other/product" }))).Status);
+    }
+
+    [Fact]
+    public void GivenLegacyCandidates_WhenReloading_PreservesOnlyConfirmedGitHubTriage()
+    {
+        var saved = sut.Save(Input(DraftInput()));
+        var file = Path.Combine(directory, "workspace.json");
+        var legacy = new
+        {
+            draft = saved.Draft! with
+            {
+                Candidates =
+                [
+                    new("gh-1", "story", "github", "Unknown", "", null),
+                    new("gh-2", "story", "github", "Confirmed", "", null, true),
+                    new("manual-3", "story", "manual", "Local", "", null)
+                ]
+            },
+            history = new[] { new HistoryEntry(saved.Draft with { Candidates = [new("gh-3", "story", "github", "Archived", "", null)] }, null, null) }
+        };
+        var state = JsonSerializer.SerializeToNode(legacy, new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        state["draft"]!["candidates"]![0]!.AsObject().Remove("triaged");
+        state["draft"]!["candidates"]![1]!.AsObject().Remove("triaged");
+        state["draft"]!["candidates"]![1]!["TRIAGED"] = true;
+        state["draft"]!["candidates"]![2]!.AsObject().Remove("triaged");
+        state["history"]![0]!["draft"]!["candidates"]![0]!.AsObject().Remove("triaged");
+        File.WriteAllText(file, state.ToJsonString());
+
+        var reloaded = new Workflow(file, agent).Snapshot();
+
+        Assert.Equal([false, true, true], reloaded.Draft!.Candidates.Select(item => item.Triaged));
+        Assert.False(reloaded.History[0].Draft.Candidates[0].Triaged);
     }
 
     [Fact]
@@ -168,6 +260,71 @@ public sealed class WorkflowTests : IDisposable
     }
 
     [Fact]
+    public void GivenTriagedStories_WhenValidating_KeepsLinkedQuestionsAndEligibleAssignments()
+    {
+        var candidates = ReviewCandidates();
+        var proposal = Workflow.ValidateProposal("""{"ranked":[{"id":"gh-1","reason":"Urgent"},{"id":"gh-2","reason":"Ready"}],"storyQuestions":[{"id":"gh-1","question":"Who signs off?"}],"assignments":["gh-2"]}""",
+            candidates, new Milestone(5, "Next", null));
+
+        Assert.Equal("gh-1", proposal.StoryQuestions![0].Id);
+        Assert.Equal(["gh-2"], proposal.Assignments);
+    }
+
+    [Fact]
+    public void GivenUntriagedStories_WhenValidating_AcceptsQuestionsWithoutRankingOrAssigningThem()
+    {
+        var candidates = ReviewCandidates();
+        candidates.Add(new("manual-4", "story", "manual", "Local review", "", null, false));
+        var proposal = Workflow.ValidateProposal("""{"ranked":[{"id":"gh-1","reason":"Urgent"},{"id":"gh-2","reason":"Ready"}],"storyQuestions":[{"id":"gh-3","question":"What is the outcome?"},{"id":"manual-4","question":"Who owns this?"}],"assignments":["gh-2"]}""",
+            candidates, new Milestone(5, "Next", null));
+
+        Assert.Equal(["gh-3", "manual-4"], proposal.StoryQuestions!.Select(item => item.Id));
+        Assert.Equal(["gh-1", "gh-2"], proposal.Ranked.Select(item => item.Id));
+        Assert.Equal(["gh-2"], proposal.Assignments);
+    }
+
+    [Theory]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"},{"id":"gh-3","reason":"c"}],"storyQuestions":[],"assignments":[]}""")]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[{"id":"unknown","question":"Why?"}],"assignments":[]}""")]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[{"id":"gh-4","question":"Why?"}],"assignments":[]}""")]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[{"id":"gh-1","question":"Why?"}],"assignments":["gh-1"]}""")]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[],"assignments":["gh-3"]}""")]
+    [InlineData("""{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[],"assignments":["unknown"]}""")]
+    public void GivenIneligibleModelOutput_WhenValidating_RejectsProposal(string raw)
+    {
+        var candidates = ReviewCandidates();
+        candidates.Add(new("gh-4", "defect", "github", "Not a story", "", null, false));
+        Assert.Equal(502, Assert.Throws<WorkflowException>(() => Workflow.ValidateProposal(raw, candidates,
+            new Milestone(5, "Next", null))).Status);
+    }
+
+    [Fact]
+    public void GivenNoMilestone_WhenValidating_RejectsAssignments()
+    {
+        var raw = """{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[],"assignments":["gh-2"]}""";
+
+        Assert.Equal(502, Assert.Throws<WorkflowException>(() => Workflow.ValidateProposal(raw, ReviewCandidates())).Status);
+    }
+
+    [Fact]
+    public void GivenAlreadyMilestonedStory_WhenValidating_RejectsAssignment()
+    {
+        var candidates = ReviewCandidates();
+        candidates[1] = candidates[1] with { MilestoneNumber = 4 };
+        var raw = """{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[],"assignments":["gh-2"]}""";
+
+        Assert.Equal(502, Assert.Throws<WorkflowException>(() => Workflow.ValidateProposal(raw, candidates,
+            new Milestone(5, "Next", null))).Status);
+    }
+
+    private static List<Candidate> ReviewCandidates() =>
+    [
+        new("gh-1", "story", "github", "Needs review", "", null),
+        new("gh-2", "story", "github", "Ready", "", null),
+        new("gh-3", "story", "github", "Not triaged", "", null, false)
+    ];
+
+    [Fact]
     public async Task GivenDeadlineDuringPlanning_WhenAgentIsCancelled_ExpiresWithoutProposal()
     {
         agent.Response = async (draft, cancellation) =>
@@ -208,16 +365,120 @@ public sealed class WorkflowTests : IDisposable
         Assert.DoesNotContain(workflow.Snapshot().Draft!.Candidates, item => item.Source == "github");
     }
 
+    [Fact]
+    public async Task GivenRepositoryOnly_WhenImporting_PreservesTriageAndFindsNextMilestone()
+    {
+        var handler = new ResponsesHandler(
+            """[{"number":7,"title":"Checkout story","body":"Review payment","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null,"html_url":"https://github.com/team/product/issues/7"},{"number":8,"title":"Unclassified","body":"","labels":[],"milestone":null}]""",
+            """[{"number":3,"title":"Later","due_on":"2027-12-01T00:00:00Z"},{"number":2,"title":"Next","due_on":"2027-01-01T00:00:00Z"}]""");
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        workflow.SelectRepository(Input(new { repository = "team/product" }));
+
+        var imported = await workflow.ImportAsync(CancellationToken.None);
+
+        Assert.Equal("", imported.Draft!.Objective);
+        Assert.Equal("", imported.Draft.Criteria);
+        Assert.Equal(imported.Draft.Revision, workflow.Authorize(Input(new { revision = imported.Draft.Revision, acknowledgeSoftCap = true })).AuthorizedRevision);
+        Assert.Equal(2, imported.NextMilestone!.Number);
+        Assert.Equal("story", imported.Draft!.Candidates[0].Kind);
+        Assert.True(imported.Draft.Candidates[0].Triaged);
+        Assert.False(imported.Draft.Candidates[1].Triaged);
+        Assert.Equal(2, new Workflow(Path.Combine(directory, "import.json"), agent).Snapshot().NextMilestone!.Number);
+        Assert.Equal(2, handler.Calls);
+    }
+
+    [Fact]
+    public async Task GivenNoOpenMilestones_WhenImporting_ExposesAbsenceAndAllowsLocalTriageCorrection()
+    {
+        var handler = new ResponsesHandler(
+            """[{"number":9,"title":"Review me","body":"","labels":[],"milestone":null}]""", "[]");
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        workflow.SelectRepository(Input(new { repository = "team/product" }));
+        var imported = await workflow.ImportAsync(CancellationToken.None);
+        var corrected = imported.Draft!.Candidates[0] with { Kind = "story", Triaged = true };
+
+        var saved = workflow.Save(Input(new { repository = "team/product", budgetUsd = 10, planningCredits = 2,
+            deadline = DateTimeOffset.UtcNow.AddDays(1), candidates = new[] { new { id = corrected.Id, kind = corrected.Kind,
+                source = corrected.Source, title = corrected.Title, body = corrected.Body, url = corrected.Url,
+                triaged = corrected.Triaged, milestoneNumber = corrected.MilestoneNumber } } }));
+
+        Assert.Null(saved.NextMilestone);
+        Assert.Equal("", saved.Draft!.Objective);
+        Assert.True(saved.Draft.Candidates[0].Triaged);
+        Assert.Equal("story", saved.Draft.Candidates[0].Kind);
+    }
+
+    [Fact]
+    public async Task GivenRemoteConflict_WhenApplying_PersistsSuccessAndRetriesOnlyRemainingStory()
+    {
+        var writer = new FakeIssueWriter();
+        writer.Issues[2] = new RemoteIssue(true, 7);
+        var workflow = await PreparedAssignmentAsync(writer);
+        var acknowledgment = Input(new { revision = 1, milestoneNumber = 5, ids = new[] { "gh-1", "gh-2" }, acknowledge = true });
+
+        var partial = await workflow.ApplyAsync(acknowledgment, CancellationToken.None);
+
+        Assert.Equal(["gh-1"], partial.AppliedStories);
+        Assert.Contains("gh-2", partial.AssignmentErrors!);
+        Assert.Equal([1], writer.Assignments);
+        var reloaded = new Workflow(Path.Combine(directory, "apply.json"), agent, issueWriter: writer);
+        Assert.Equal(409, (await Assert.ThrowsAsync<WorkflowException>(() => reloaded.ApplyAsync(acknowledgment, CancellationToken.None))).Status);
+        writer.Issues[2] = new RemoteIssue(true, null);
+        writer.FailAssignments.Add(2);
+        var retry = Input(new { revision = 1, milestoneNumber = 5, ids = new[] { "gh-2" }, acknowledge = true });
+        var failed = await reloaded.ApplyAsync(retry, CancellationToken.None);
+        Assert.Equal(["gh-1"], failed.AppliedStories);
+        Assert.Contains("gh-2", failed.AssignmentErrors!);
+        writer.FailAssignments.Clear();
+        var completed = await reloaded.ApplyAsync(retry, CancellationToken.None);
+
+        Assert.Equal(["gh-1", "gh-2"], completed.AppliedStories);
+        Assert.Empty(completed.AssignmentErrors!);
+        Assert.Equal([1, 2], writer.Assignments);
+    }
+
+    [Fact]
+    public async Task GivenMissingOrStaleAcknowledgement_WhenApplying_DoesNotReadOrAssign()
+    {
+        var writer = new FakeIssueWriter();
+        var workflow = await PreparedAssignmentAsync(writer);
+
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.ApplyAsync(Input(new { revision = 0, milestoneNumber = 5,
+            ids = new[] { "gh-1", "gh-2" }, acknowledge = true }), CancellationToken.None));
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.ApplyAsync(Input(new { revision = 1, milestoneNumber = 5,
+            ids = new[] { "gh-1", "gh-2" }, acknowledge = false }), CancellationToken.None));
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.ApplyAsync(Input(new { revision = 1, milestoneNumber = 5,
+            ids = new[] { "gh-1" }, acknowledge = true }), CancellationToken.None));
+
+        Assert.Empty(writer.Reads);
+        Assert.Empty(writer.Assignments);
+    }
+
+    private async Task<Workflow> PreparedAssignmentAsync(FakeIssueWriter writer)
+    {
+        var handler = new ResponsesHandler(
+            """[{"number":1,"title":"Story A","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null},{"number":2,"title":"Story B","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null}]""",
+            """[{"number":5,"title":"Next","due_on":null}]""");
+        var workflow = new Workflow(Path.Combine(directory, "apply.json"), agent, new HttpClient(handler), writer);
+        workflow.SelectRepository(Input(new { repository = "team/product" }));
+        await workflow.ImportAsync(CancellationToken.None);
+        agent.Response = (draft, cancellation) => Task.FromResult(
+            """{"ranked":[{"id":"gh-1","reason":"a"},{"id":"gh-2","reason":"b"}],"storyQuestions":[],"assignments":["gh-1","gh-2"]}""");
+        workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+        await workflow.TriageAsync(Input(new { revision = 1 }));
+        return workflow;
+    }
+
     private sealed class FakeProductOwner : IProductOwner
     {
         public int Calls { get; private set; }
         public Func<Draft, CancellationToken, Task<string>>? Response { get; set; }
 
-        public Task<string> RunAsync(Draft draft, CancellationToken cancellation)
+        public Task<string> RunAsync(Draft draft, Milestone? nextMilestone, CancellationToken cancellation)
         {
             Calls++;
             if (Response is not null) return Response(draft, cancellation);
-            return Task.FromResult(JsonSerializer.Serialize(new { ranked = draft.Candidates.Select(item => new { id = item.Id, reason = "High impact" }), questions = Array.Empty<string>() }));
+            return Task.FromResult(JsonSerializer.Serialize(new { ranked = draft.Candidates.Where(item => item.Triaged).Select(item => new { id = item.Id, reason = "High impact" }), storyQuestions = Array.Empty<object>(), assignments = Array.Empty<string>() }));
         }
     }
 
@@ -230,6 +491,40 @@ public sealed class WorkflowTests : IDisposable
         {
             Entered.SetResult();
             return await Release.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    private sealed class ResponsesHandler(params string[] responses) : HttpMessageHandler
+    {
+        public int Calls { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(responses[Calls++], System.Text.Encoding.UTF8, "application/json")
+            });
+        }
+    }
+
+    private sealed class FakeIssueWriter : IGitHubIssueWriter
+    {
+        public Dictionary<int, RemoteIssue> Issues { get; } = new();
+        public List<int> Reads { get; } = [];
+        public List<int> Assignments { get; } = [];
+        public HashSet<int> FailAssignments { get; } = [];
+
+        public Task<RemoteIssue> ReadAsync(string repository, int number, CancellationToken cancellation)
+        {
+            Reads.Add(number);
+            return Task.FromResult(Issues.GetValueOrDefault(number, new RemoteIssue(true, null)));
+        }
+
+        public Task AssignAsync(string repository, int number, int milestoneNumber, CancellationToken cancellation)
+        {
+            if (FailAssignments.Contains(number)) throw new WorkflowException("Simulated GitHub failure", 502);
+            Assignments.Add(number);
+            return Task.CompletedTask;
         }
     }
 }

@@ -112,8 +112,14 @@ textarea { resize: vertical; min-height: 82px; }
 .rank p { color: var(--cp-text-muted); }
 .rank-actions { display: flex; gap: 4px; }
 .tag { color: var(--cp-accent); font: 12px Consolas, "Courier New", Courier, monospace; text-transform: uppercase; }
+.review-questions { border-top: 1px solid var(--cp-border); padding: 16px 0; }
+.review-questions p { padding: 6px 0; overflow-wrap: anywhere; }
+.assignment-review { border-top: 1px solid var(--cp-border-strong); margin-top: 28px; padding-top: 24px; }
+.assignment-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; border-bottom: 1px solid var(--cp-border); padding: 12px 0; overflow-wrap: anywhere; }
+.assignment-row > span:last-child { text-align: right; }
+.apply-check { margin: 20px 0 12px; }
 a { color: var(--cp-link); }
 .history { margin-top: 48px; border-top: 1px solid var(--cp-border-strong); padding-top: 24px; }
 .history-item { padding: 10px 0; border-bottom: 1px solid var(--cp-border); overflow-wrap: anywhere; }
 @media (max-width: 840px) { .workspace { grid-template-columns: 1fr; } }
-@media (max-width: 480px) { header { align-items: start; flex-direction: column; } .field-grid, .issue-grid, .agent-setting { grid-template-columns: 1fr; } .rank { grid-template-columns: 28px minmax(0, 1fr); } .rank-actions { grid-column: 2; } }
+@media (max-width: 480px) { header { align-items: start; flex-direction: column; } .field-grid, .issue-grid, .agent-setting { grid-template-columns: 1fr; } .rank { grid-template-columns: 28px minmax(0, 1fr); } .rank-actions { grid-column: 2; } .assignment-row { align-items: start; flex-direction: column; gap: 4px; } .assignment-row > span:last-child { text-align: left; } }

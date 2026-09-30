@@ -29,11 +29,33 @@ param(
 $ErrorActionPreference = 'Stop'
 
 #region Functions
+function Test-AppProcessPath {
+    param($Process, [string]$ExpectedPath)
+
+    $NormalizedPath = $ExpectedPath.Replace('/', '\')
+    if ($Process.CommandLine -and
+        $Process.CommandLine.Replace('/', '\').Contains($NormalizedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    if ($Process.Name -ieq 'dotnet.exe' -and [IO.Path]::GetExtension($ExpectedPath) -ieq '.dll') {
+        try {
+            $HostProcess = Get-Process -Id $Process.ProcessId -ErrorAction SilentlyContinue
+            if ($HostProcess) {
+                return [bool](@($HostProcess.Modules | Where-Object { $_.FileName -ieq $NormalizedPath }).Count)
+            }
+        }
+        catch {
+            return $false
+        }
+    }
+    return $false
+}
+
 function Get-AppProcess {
     param([int]$ProcessId, [string]$ExpectedArgument)
 
     $Process = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
-    if ($Process -and $Process.CommandLine -and $Process.CommandLine.Contains($ExpectedArgument, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($Process -and (Test-AppProcessPath -Process $Process -ExpectedPath $ExpectedArgument)) {
         return $Process
     }
     return $null
@@ -88,9 +110,9 @@ function Get-RunningAppProcesses {
     param([string]$BackendDll, [string]$BackendExe, [string]$FrontendEntry)
 
     Get-CimInstance Win32_Process -Filter "Name = 'ShipWithin.Api.exe' OR Name = 'dotnet.exe' OR Name = 'node.exe'" | Where-Object {
-        ($_.Name -ieq 'ShipWithin.Api.exe' -and $_.ExecutablePath -ieq $BackendExe) -or
-        ($_.Name -ieq 'dotnet.exe' -and $_.CommandLine -and $_.CommandLine.Contains($BackendDll, [StringComparison]::OrdinalIgnoreCase)) -or
-        ($_.Name -ieq 'node.exe' -and $_.CommandLine -and $_.CommandLine.Contains($FrontendEntry, [StringComparison]::OrdinalIgnoreCase))
+        ($_.Name -ieq 'ShipWithin.Api.exe' -and $_.ExecutablePath -and $_.ExecutablePath.Replace('/', '\') -ieq $BackendExe.Replace('/', '\')) -or
+        ($_.Name -ieq 'dotnet.exe' -and (Test-AppProcessPath -Process $_ -ExpectedPath $BackendDll)) -or
+        ($_.Name -ieq 'node.exe' -and (Test-AppProcessPath -Process $_ -ExpectedPath $FrontendEntry))
     }
 }
 

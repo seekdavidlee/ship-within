@@ -62,5 +62,6 @@ app.MapPost("/api/triage", (JsonElement input, Workflow workflow) => workflow.Tr
 app.MapPost("/api/new", async (HttpContext context, Workflow workflow) => workflow.New(
     context.Request.ContentLength is > 0 ? await context.Request.ReadFromJsonAsync<JsonElement>() : default));
 app.MapPut("/api/proposal/order", (JsonElement input, Workflow workflow) => workflow.Order(input));
+app.MapPost("/api/proposal/apply", (JsonElement input, Workflow workflow, CancellationToken cancellation) => workflow.ApplyAsync(input, cancellation));
 
 app.Run();

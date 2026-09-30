@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowLeft, ArrowUp, ChevronRight, Play, Plus, RotateCcw, Search, Settings, Trash2 } from 'lucide-react';
 
-type Candidate = { id: string; kind: 'defect' | 'feature' | 'unclassified'; source: 'github' | 'manual'; title: string; body: string; url: string | null };
-type Draft = { repository: string; objective: string; criteria: string; budgetUsd: string; planningCredits: string; deadline: string; candidates: Candidate[]; revision?: number };
-type SavedDraft = Omit<Draft, 'budgetUsd' | 'planningCredits'> & { budgetUsd: number; planningCredits: number; revision: number };
+type Candidate = { id: string; kind: 'story' | 'defect' | 'feature' | 'unclassified'; source: 'github' | 'manual'; title: string; body: string; url: string | null; triaged: boolean; milestoneNumber: number | null };
+type Draft = { repository: string; objective: string; criteria: string; planningCredits: string; deadline: string; candidates: Candidate[]; revision?: number };
+type SavedDraft = Omit<Draft, 'planningCredits'> & { planningCredits: number; estimatedCostUsd: number; revision: number };
 type Run = { status: string; message?: string; usage: string; usageReconciliation?: { confirmedAt: string; method: string } };
-type Proposal = { ranked: { id: string; reason: string }[]; questions: string[] };
-type Workspace = { repository: string | null; draft: SavedDraft | null; authorizedRevision: number | null; run: Run | null; proposal: Proposal | null; history: { draft: SavedDraft; run: Run | null; proposal: Proposal | null }[]; agentModels: Record<string, string> };
+type Proposal = { ranked: { id: string; reason: string }[]; questions?: string[]; storyQuestions?: { id: string; question: string }[]; assignments?: string[] };
+type Workspace = { repository: string | null; draft: SavedDraft | null; authorizedRevision: number | null; run: Run | null; proposal: Proposal | null; history: { draft: SavedDraft; run: Run | null; proposal: Proposal | null }[]; agentModels: Record<string, string>; nextMilestone?: { number: number; title: string; dueOn: string | null } | null; appliedStories?: string[] | null; assignmentErrors?: Record<string, string> | null };
 type RepositoryListing = { owner: string; repositories: string[] };
 type AvailableModel = { id: string; name: string };
 
 const empty: Workspace = { repository: null, draft: null, authorizedRevision: null, run: null, proposal: null, history: [], agentModels: { productOwner: 'gpt-4.1' } };
-const blank = (repository = ''): Draft => ({ repository, objective: '', criteria: '', budgetUsd: '10', planningCredits: '2', deadline: '', candidates: [] });
+const blank = (repository = ''): Draft => ({ repository, objective: '', criteria: '', planningCredits: '2', deadline: localDeadline(new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()), candidates: [] });
+const usd = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 const validRepository = (repository: string) => /^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(repository) && !repository.includes('..');
 const repositoryFromUrl = () => {
   const repository = new URLSearchParams(window.location.search).get('repository') || '';
@@ -42,6 +43,8 @@ export default function App() {
   const [draft, setDraft] = useState<Draft>(() => blank(repositoryFromUrl()));
   const [dirty, setDirty] = useState(false);
   const [ack, setAck] = useState(false);
+  const [applyAck, setApplyAck] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [repositories, setRepositories] = useState<string[]>([]);
   const [owner, setOwner] = useState('');
@@ -55,10 +58,11 @@ export default function App() {
   function applyState(next: Workspace) {
     setState(next);
     setAgentModel(next.agentModels.productOwner);
-    setDraft(next.draft ? { ...next.draft, budgetUsd: String(next.draft.budgetUsd), planningCredits: String(next.draft.planningCredits), deadline: localDeadline(next.draft.deadline), candidates: structuredClone(next.draft.candidates) } : blank(next.repository || ''));
+    setDraft(next.draft ? { repository: next.draft.repository, objective: next.draft.objective, criteria: next.draft.criteria, planningCredits: String(next.draft.planningCredits), deadline: localDeadline(next.draft.deadline), candidates: structuredClone(next.draft.candidates), revision: next.draft.revision } : blank(next.repository || ''));
     setManualRepository(false);
     setDirty(false);
     setAck(false);
+    setApplyAck(false);
     showState(next);
   }
 
@@ -66,7 +70,7 @@ export default function App() {
     const run = next.run;
     if (run) setNotice({ text: `${run.status.toUpperCase()} | ${run.message || 'Planning attempt underway.'} Usage: ${run.usage}. ${run.status === 'completed' ? 'Proposal requires human review.' : 'No automatic retry.'}`, tone: run.status === 'completed' ? 'success' : run.status === 'running' ? '' : 'error' });
     else if (next.draft && next.authorizedRevision === next.draft.revision) setNotice({ text: `Revision ${next.draft.revision} authorized for one planning attempt.`, tone: 'success' });
-    else setNotice({ text: next.draft ? 'Saved. Review this revision before authorizing planning.' : 'Start with a kickoff objective and candidates.', tone: '' });
+    else setNotice({ text: next.draft ? 'Review imported stories and save local corrections before authorizing planning.' : 'Select a repository and import its open issues.', tone: '' });
   }
 
   async function loadRepositories(requestedOwner: string) {
@@ -145,7 +149,7 @@ export default function App() {
     setAck(false);
   }
 
-  function changeCandidate(id: string, key: 'title' | 'body' | 'kind', value: string) {
+  function changeCandidate(id: string, key: 'title' | 'body' | 'kind' | 'triaged', value: string | boolean) {
     change('candidates', draft.candidates.map(item => item.id === id ? { ...item, [key]: value } : item));
   }
 
@@ -159,7 +163,7 @@ export default function App() {
 
   function save(event: FormEvent) {
     event.preventDefault();
-    const values = { ...draft, deadline: new Date(draft.deadline).toISOString(), budgetUsd: Number(draft.budgetUsd), planningCredits: Number(draft.planningCredits) };
+    const values = { ...draft, deadline: new Date(draft.deadline).toISOString(), planningCredits: Number(draft.planningCredits) };
     void execute(async () => applyState(await api('/api/draft', 'PUT', values)));
   }
 
@@ -167,7 +171,7 @@ export default function App() {
     const unknown = [state.run, ...state.history.map(item => item.run)].some(run => run?.usage === 'unknown' && !run.usageReconciliation);
     const warning = dirty ? ' Unsaved kickoff changes will be lost.' : '';
     if ((Boolean(state.draft) || dirty || unknown) && !window.confirm((unknown
-      ? 'Before another planning attempt, check prior AI Credit usage outside this app. Have you reconciled the unknown usage and chosen to record that decision with the archived attempt? The USD budget is not enforced.'
+      ? 'Before another planning attempt, check prior AI Credit usage outside this app. Have you reconciled the unknown usage and chosen to record that decision with the archived attempt? USD estimates are for reporting only, not actual spend.'
       : 'Archive this kickoff and start a new one? Previous attempts remain in local history.') + warning)) return;
     void execute(async () => {
       const next = await api('/api/new', 'POST', unknown ? { reconcileUsage: true } : undefined);
@@ -184,6 +188,9 @@ export default function App() {
   const choosingManually = manualRepository || Boolean(repositoryError);
   const choices = draft.repository && !repositories.includes(draft.repository) ? [draft.repository, ...repositories] : repositories;
   const modelAvailable = availableModels.some(model => model.id === agentModel);
+  const assignments = state.proposal?.assignments || [];
+  const remaining = assignments.filter(id => !state.appliedStories?.includes(id));
+  const questions = state.proposal?.storyQuestions || [];
 
   if (page === '/settings' || page === '/settings/agents') return <div className="wrap">
     <header>
@@ -267,18 +274,15 @@ export default function App() {
               </label>
               </> : null}
               {detailsRepository && <>
-              <label className="wide">Objective <textarea required maxLength={2000} value={draft.objective} onChange={event => change('objective', event.target.value)} placeholder="What should be prioritized?" /></label>
-              <label className="wide">Acceptance criteria <textarea required maxLength={2000} value={draft.criteria} onChange={event => change('criteria', event.target.value)} placeholder="What should a useful ranking account for?" /></label>
-              <label>USD budget (record only) <input required type="number" step="0.01" min="0.01" value={draft.budgetUsd} onChange={event => change('budgetUsd', event.target.value)} /></label>
-              <label>Planning AI Credits (soft cap) <input required type="number" step="1" min="1" max="100" value={draft.planningCredits} onChange={event => change('planningCredits', event.target.value)} /></label>
+              <label className="wide">AI Credits (soft cap) <input aria-label="AI Credits (soft cap)" required type="number" step="1" min="1" max="100" value={draft.planningCredits} onChange={event => change('planningCredits', event.target.value)} /><span className="muted small">Allocation estimate: {usd(Number(draft.planningCredits) * 0.01)} USD</span></label>
               <label className="wide">UTC deadline <input required type="datetime-local" value={draft.deadline} onChange={event => change('deadline', event.target.value)} /></label>
               </>}
             </fieldset>
-            {detailsRepository && <div className="controls"><button className="btn" type="submit" disabled={used || busy}>Save objective</button></div>}
+            {detailsRepository && <div className="controls"><button className="btn" type="submit" disabled={used || busy || (!dirty && Boolean(state.draft))}>Save review settings</button></div>}
           </form>
           {!detailsRepository && notice.tone === 'error' && <div className="notice error" role="alert"><p>{notice.text}</p></div>}
           {detailsRepository && <>
-          <div className="notice"><p>AI Credits are a soft limit and may overshoot. The USD budget is recorded but not enforced. A run can incur charges even if it expires or fails.</p></div>
+          <div className="notice"><p>AI Credits are a soft limit and may overshoot. Reporting assumes 1 GitHub AI credit = $0.01 USD; estimates are not actual spend. A run can incur charges even if it expires or fails.</p></div>
           <label className="check"><input type="checkbox" checked={ack} disabled={used || busy} onChange={event => setAck(event.target.checked)} />I authorize one planning attempt for the saved revision under these limits.</label>
           <div className="controls">
             <button className="btn" type="button" disabled={!saved || used || busy || !draft.candidates.length || !ack} onClick={() => void execute(async () => { const next = await api('/api/authorize', 'POST', { revision: state.draft?.revision, acknowledgeSoftCap: ack }); setState(next); showState(next); })}>Authorize revision</button>
@@ -295,17 +299,22 @@ export default function App() {
         </section>
         {detailsRepository &&
         <section aria-labelledby="candidates-title">
-          <div className="section-head"><h2 id="candidates-title">Candidates</h2><span>{draft.candidates.length} item{draft.candidates.length === 1 ? '' : 's'}</span></div>
+          <div className="section-head"><h2 id="candidates-title">Backlog review</h2><span>{draft.candidates.length} item{draft.candidates.length === 1 ? '' : 's'}</span></div>
           <div className="controls">
-            <button className="btn" type="button" disabled={used || busy || draft.candidates.length >= 30} onClick={() => change('candidates', [...draft.candidates, { id: crypto.randomUUID(), source: 'manual', title: '', body: '', kind: 'unclassified', url: null }])}><Plus size={16} /> Add item</button>
-            <button className="btn" type="button" disabled={!saved || used || busy} onClick={() => void execute(async () => applyState(await api('/api/issues/import', 'POST')))}>Import public issues</button>
+            <button className="btn primary" type="button" disabled={used || busy || importing || dirty} onClick={() => { setImporting(true); void execute(async () => {
+              try { applyState(await api('/api/issues/import', 'POST')); }
+              finally { setImporting(false); }
+            }); }}>{importing ? 'Importing...' : 'Import public issues'}</button>
+            <button className="btn" type="button" disabled={used || busy || draft.candidates.length >= 30} onClick={() => change('candidates', [...draft.candidates, { id: crypto.randomUUID(), source: 'manual', title: '', body: '', kind: 'unclassified', url: null, triaged: true, milestoneNumber: null }])}><Plus size={16} /> Add item</button>
           </div>
-          <div className="issue-list">{draft.candidates.length === 0 && <p className="empty">No candidates yet. Add one or import public issues.</p>}
+          <p className="muted small">Next open milestone: {state.nextMilestone ? `${state.nextMilestone.title} (#${state.nextMilestone.number})` : 'None available'}</p>
+          <div className="issue-list">{draft.candidates.length === 0 && <p className="empty">No open issues imported yet.</p>}
             {draft.candidates.map(item => <div className="issue" key={item.id}>
-              <div className="issue-top"><span>{item.source === 'github' ? item.id : 'MANUAL'}</span><button type="button" className="btn icon" title="Remove candidate" aria-label={`Remove ${item.title || 'candidate'}`} disabled={used || busy} onClick={() => change('candidates', draft.candidates.filter(candidate => candidate.id !== item.id))}><Trash2 size={16} /></button></div>
+              <div className="issue-top"><span>{item.source === 'github' ? item.id : 'MANUAL'} {item.milestoneNumber ? `| milestone #${item.milestoneNumber}` : ''}</span><button type="button" className="btn icon" title="Remove candidate" aria-label={`Remove ${item.title || 'candidate'}`} disabled={used || busy} onClick={() => change('candidates', draft.candidates.filter(candidate => candidate.id !== item.id))}><Trash2 size={16} /></button></div>
               <div className="issue-grid">
                 <label>Title <input value={item.title} required maxLength={180} disabled={used || busy} onChange={event => changeCandidate(item.id, 'title', event.target.value)} /></label>
-                <label>Type <select value={item.kind} disabled={used || busy} onChange={event => changeCandidate(item.id, 'kind', event.target.value)}><option value="defect">defect</option><option value="feature">feature</option><option value="unclassified">unclassified</option></select></label>
+                <label>Type <select value={item.kind} disabled={used || busy} onChange={event => changeCandidate(item.id, 'kind', event.target.value)}><option value="story">story</option><option value="defect">defect</option><option value="feature">feature</option><option value="unclassified">unclassified</option></select></label>
+                <label className="check"><input type="checkbox" checked={item.triaged} disabled={used || busy} onChange={event => changeCandidate(item.id, 'triaged', event.target.checked)} />Triaged</label>
                 <label>Context <textarea value={item.body} maxLength={1200} disabled={used || busy} onChange={event => changeCandidate(item.id, 'body', event.target.value)} /></label>
               </div>
             </div>)}
@@ -314,23 +323,49 @@ export default function App() {
         }
       </div>
       {detailsRepository && <>
-      <section className="review" aria-labelledby="review-title"><div className="section-head"><h2 id="review-title">Priority review</h2><span>{state.proposal ? 'UNAPPROVED DRAFT' : 'No proposal'}</span></div>
-        {!state.proposal && <p className="empty">No proposal yet.</p>}
+      <section className="review" aria-labelledby="review-title"><div className="section-head"><h2 id="review-title">Story review & priorities</h2><span>{state.proposal ? 'REVIEW REQUIRED' : 'No proposal'}</span></div>
+        {!state.proposal && <p className="empty">{state.run?.status === 'running' || state.run?.status === 'stopping' ? 'Product Owner is reviewing the backlog...' : 'Run Product Owner to review imported stories and rank triaged issues.'}</p>}
+        {!!questions.length && <div className="review-questions"><h3>Questions to resolve</h3>
+          {questions.map((item, index) => <p key={`${item.id}-${index}`}><span className="tag">{item.id}</span> {item.question}</p>)}
+        </div>}
         {state.proposal?.ranked.map((item, index) => {
           const candidate = state.draft?.candidates.find(entry => entry.id === item.id);
           if (!candidate) return null;
-          return <div className="rank" key={item.id}><span className="rank-number">{String(index + 1).padStart(2, '0')}</span><div><span className="tag">{candidate.kind}</span><h3>{candidate.title}</h3><p>{item.reason}</p>{candidate.url && <a href={candidate.url} target="_blank" rel="noopener noreferrer">View issue</a>}</div>
+          return <div className="rank" key={item.id}><span className="rank-number">{String(index + 1).padStart(2, '0')}</span><div><span className="tag">{candidate.kind}</span><h3>{candidate.title}</h3><p>{item.reason}</p>{candidate.url && <a href={candidate.url} target="_blank" rel="noopener noreferrer">View issue</a>}{candidate.kind === 'story' && questions.some(question => question.id === item.id) && <p className="field-hint">Questions outstanding. Not eligible for assignment.</p>}</div>
             <div className="rank-actions">{([-1, 1] as const).map(direction => <button key={direction} className="btn icon" type="button" title={direction < 0 ? 'Move up' : 'Move down'} aria-label={`${direction < 0 ? 'Move up' : 'Move down'}: ${candidate.title}`} disabled={busy || index + direction < 0 || index + direction >= state.proposal!.ranked.length} onClick={() => void execute(async () => {
               const ids = state.proposal!.ranked.map(entry => entry.id);
               [ids[index], ids[index + direction]] = [ids[index + direction], ids[index]];
               const next = await api('/api/proposal/order', 'PUT', { ids }); setState(next); setNotice({ text: 'Draft priority order updated. No GitHub issue was changed.', tone: 'success' });
             })}>{direction < 0 ? <ArrowUp size={16} /> : <ArrowDown size={16} />}</button>)}</div></div>;
         })}
-        {!!state.proposal?.questions.length && <div><h3>Open questions</h3><ul>{state.proposal.questions.map(question => <li key={question}>{question}</li>)}</ul></div>}
+        {!!state.proposal?.questions?.length && <div><h3>Open questions</h3><ul>{state.proposal.questions.map(question => <li key={question}>{question}</li>)}</ul></div>}
+        {state.proposal && <div className="assignment-review">
+          <div className="section-head"><h3>Next milestone</h3><span>{state.nextMilestone ? `${state.nextMilestone.title} #${state.nextMilestone.number}` : 'No open milestone'}</span></div>
+          {!state.nextMilestone && <p className="muted">Assignment is unavailable until the repository has an open milestone.</p>}
+          {state.nextMilestone && assignments.length === 0 && <p className="muted">No reviewed stories are ready for assignment. Resolve questions and import again for a new planning attempt.</p>}
+          {assignments.map(id => {
+            const candidate = state.draft?.candidates.find(item => item.id === id);
+            const applied = state.appliedStories?.includes(id);
+            return <div className="assignment-row" key={id}><span>{candidate?.title || id} <span className="tag">{id}</span></span><span className={state.assignmentErrors?.[id] ? 'field-hint' : 'muted small'}>{applied ? 'Assigned' : state.assignmentErrors?.[id] || 'Ready for approval'}</span></div>;
+          })}
+          {remaining.length > 0 && state.nextMilestone && <>
+            <label className="check apply-check"><input type="checkbox" checked={applyAck} disabled={busy} onChange={event => setApplyAck(event.target.checked)} />Approve assignment of {remaining.length} reviewed stor{remaining.length === 1 ? 'y' : 'ies'} to {state.nextMilestone.title}.</label>
+            <button className="btn primary" type="button" disabled={busy || !applyAck} onClick={() => {
+              const milestone = state.nextMilestone!;
+              if (!window.confirm(`Assign ${remaining.join(', ')} to ${milestone.title} (#${milestone.number}) in ${state.repository}? This will change GitHub issues.`)) return;
+              void execute(async () => {
+                const next = await api('/api/proposal/apply', 'POST', { revision: state.draft!.revision, milestoneNumber: milestone.number, ids: remaining, acknowledge: true });
+                applyState(next);
+                setNotice({ text: Object.keys(next.assignmentErrors || {}).length ? 'Some assignments could not be applied. Review each issue and retry the remaining stories.' : 'Reviewed stories assigned to GitHub milestone.', tone: Object.keys(next.assignmentErrors || {}).length ? 'error' : 'success' });
+              });
+            }}>Assign reviewed stories</button>
+            <p className="muted small">Issues are checked before each update. A GitHub change made between that check and the update may still win.</p>
+          </>}
+        </div>}
       </section>
       <section className="history" aria-labelledby="history-title"><div className="section-head"><h2 id="history-title">Previous kickoffs</h2></div>
         {state.history.length === 0 && <p className="small muted">No previous kickoffs.</p>}
-        {state.history.map((entry, index) => <div className="history-item small muted" key={index}>{entry.draft.repository} | {entry.run?.status || 'not run'} | {entry.proposal ? 'proposal saved' : 'no proposal'} | {entry.run?.usage === 'unknown' ? entry.run.usageReconciliation ? `External usage reconciled ${entry.run.usageReconciliation.confirmedAt}` : 'Usage not reconciled' : 'No usage decision needed'} | {entry.draft.deadline}</div>)}
+        {state.history.map((entry, index) => <div className="history-item small muted" key={index}>{entry.draft.repository} | {entry.draft.planningCredits} AI Credits ({usd(entry.draft.estimatedCostUsd)} USD allocation estimate) | {entry.run?.status || 'not run'} | {entry.proposal ? 'proposal saved' : 'no proposal'} | {entry.run?.usage === 'unknown' ? entry.run.usageReconciliation ? `External usage reconciled ${entry.run.usageReconciliation.confirmedAt}` : 'Usage not reconciled' : 'No usage decision needed'} | {entry.draft.deadline}</div>)}
       </section>
       </>}
     </main>
