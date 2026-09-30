@@ -71,7 +71,7 @@ h3 { margin: 0; font-size: 16px; }
 p { margin: 4px 0 0; }
 .muted { color: var(--cp-text-muted); }
 .small { font-size: 13px; }
-.workspace { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(300px, .9fr); gap: 32px; align-items: start; }
+.workspace { display: block; }
 .workspace.first-visit { display: block; }
 section { min-width: 0; }
 .section-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 20px; }

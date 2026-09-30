@@ -16,7 +16,7 @@ public sealed class WorkflowTests : IDisposable
     /// <summary>Creates an isolated local state file.</summary>
     public WorkflowTests()
     {
-        sut = new Workflow(Path.Combine(directory, "workspace.json"), agent);
+        sut = new Workflow(Path.Combine(directory, "workspace.json"), agent, new HttpClient(new ResponsesHandler("[]", "[]")));
     }
 
     /// <summary>Deletes test-only local state.</summary>
@@ -30,6 +30,14 @@ public sealed class WorkflowTests : IDisposable
         planningCredits = 2, deadline = DateTimeOffset.UtcNow.AddMinutes(2).ToString("O"), model = "gpt-4.1",
         candidates = new[] { new { title = "Sign-in fails", kind = "defect", source = "manual", body = "Cannot sign in" } }
     };
+
+    private static Dictionary<string, object?>[] Issues(int start, int count) => Enumerable.Range(start, count).Select(number =>
+        new Dictionary<string, object?>
+        {
+            ["number"] = number, ["title"] = $"Story {number}", ["body"] = "Review this story",
+            ["labels"] = new[] { new { name = "story" } }, ["milestone"] = null,
+            ["html_url"] = $"https://github.com/team/product/issues/{number}"
+        }).ToArray();
 
     [Theory]
     [InlineData(1, 0.01)]
@@ -194,6 +202,155 @@ public sealed class WorkflowTests : IDisposable
 
         Assert.Equal([false, true, true], reloaded.Draft!.Candidates.Select(item => item.Triaged));
         Assert.False(reloaded.History[0].Draft.Candidates[0].Triaged);
+    }
+
+    [Fact]
+    public async Task GivenEmptySavedBacklog_WhenKickingOff_ImportsEveryPageBeforeOnePoCall()
+    {
+        var firstPage = Issues(1, 100);
+        firstPage[0]["pull_request"] = new { url = "https://api.github.com/repos/team/product/pulls/1" };
+        firstPage[1]["labels"] = new[] { new { name = "story" }, new { name = "triaged" } };
+        var handler = new ResponsesHandler(JsonSerializer.Serialize(firstPage), JsonSerializer.Serialize(Issues(101, 36)),
+            """[{"number":5,"title":"Next","due_on":null}]""");
+        var writer = new FakeIssueWriter();
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler), writer);
+        var input = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(Input(DraftInput()).GetRawText())!;
+        input["candidates"] = Input(Array.Empty<object>());
+        var saved = workflow.Save(Input(input));
+        Draft? reviewed = null;
+        agent.Response = (draft, cancellation) =>
+        {
+            reviewed = draft;
+            return Task.FromResult(JsonSerializer.Serialize(new { ranked = draft.Candidates.Where(item => item.Triaged)
+                .Select(item => new { id = item.Id, reason = "High impact" }), storyQuestions = Array.Empty<object>(), assignments = Array.Empty<string>() }));
+        };
+        workflow.Authorize(Input(new { revision = saved.Draft!.Revision, acknowledgeSoftCap = true }));
+
+        var result = await workflow.TriageAsync(Input(new { revision = saved.Draft.Revision }));
+
+        Assert.NotNull(reviewed);
+        Assert.Equal(135, reviewed.Candidates.Count);
+        Assert.Equal(Enumerable.Range(2, 134).Append(136).Select(number => $"gh-{number}"), reviewed.Candidates.Select(item => item.Id));
+        Assert.Equal(saved.Draft.Revision, reviewed.Revision);
+        Assert.Equal(saved.Draft.Deadline, reviewed.Deadline);
+        Assert.Equal(saved.Draft.PlanningCredits, reviewed.PlanningCredits);
+        Assert.Equal(saved.Draft.Model, reviewed.Model);
+        Assert.Equal("completed", result.Run!.Status);
+        Assert.Equal(saved.Draft.Revision, result.Run.Revision);
+        Assert.Equal(5, result.NextMilestone!.Number);
+        Assert.Equal(3, handler.Calls);
+        Assert.Equal(1, agent.Calls);
+        Assert.Null(result.AuthorizedRevision);
+        Assert.Empty(writer.Assignments);
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = saved.Draft.Revision })));
+        Assert.Equal(3, handler.Calls);
+        Assert.Equal(1, agent.Calls);
+    }
+
+    [Fact]
+    public async Task GivenExistingBacklog_WhenKickingOff_RefreshesGitHubAndRetainsManualContext()
+    {
+        var handler = new ResponsesHandler(JsonSerializer.Serialize(Issues(1, 1)), "[]", JsonSerializer.Serialize(Issues(9, 1)),
+            """[{"number":4,"title":"Fresh milestone","due_on":null}]""");
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(DraftInput()));
+        var imported = await workflow.ImportAsync(CancellationToken.None);
+        workflow.Authorize(Input(new { revision = imported.Draft!.Revision, acknowledgeSoftCap = true }));
+
+        var result = await workflow.TriageAsync(Input(new { revision = imported.Draft.Revision }));
+
+        Assert.Equal(["manual-1", "gh-9"], result.Draft!.Candidates.Select(item => item.Id));
+        Assert.Equal(imported.Draft.Revision, result.Draft.Revision);
+        Assert.Equal(4, result.NextMilestone!.Number);
+        Assert.Equal(1, agent.Calls);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task GivenFailedBacklogImport_WhenKickingOff_DoesNotDispatchOrPublishPartialIssues(int failedCall)
+    {
+        var handler = new ResponsesHandler(JsonSerializer.Serialize(Issues(1, 100)), "[]", "[]") { FailedCall = failedCall };
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(DraftInput()));
+        workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+
+        var error = await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+
+        Assert.Equal(502, error.Status);
+        Assert.Equal(failedCall, handler.Calls);
+        Assert.Equal(0, agent.Calls);
+        Assert.Equal("failed", workflow.Snapshot().Run!.Status);
+        Assert.Equal("not-started", workflow.Snapshot().Run!.Usage);
+        Assert.Equal("manual-1", Assert.Single(workflow.Snapshot().Draft!.Candidates).Id);
+        Assert.Null(workflow.Snapshot().Proposal);
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+        Assert.Equal(failedCall, handler.Calls);
+        Assert.Null(workflow.New(default).Run);
+    }
+
+    [Fact]
+    public async Task GivenEmptyRepository_WhenKickingOff_StopsWithoutPaidDispatch()
+    {
+        var handler = new ResponsesHandler("[]", "[]");
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(new { repository = "team/product", planningCredits = 2,
+            deadline = DateTimeOffset.UtcNow.AddMinutes(2), candidates = Array.Empty<object>() }));
+        workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+
+        var error = await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+
+        Assert.Contains("No open issues", error.Message);
+        Assert.Equal(2, handler.Calls);
+        Assert.Equal(0, agent.Calls);
+        Assert.Equal("not-started", workflow.Snapshot().Run!.Usage);
+        Assert.Null(workflow.Snapshot().Proposal);
+    }
+
+    [Fact]
+    public async Task GivenMissingOrStaleAuthorization_WhenKickingOff_DoesNotFetchBacklog()
+    {
+        var handler = new ResponsesHandler("[]", "[]");
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(new { repository = "team/product", planningCredits = 2,
+            deadline = DateTimeOffset.UtcNow.AddMinutes(2), candidates = Array.Empty<object>() }));
+        Assert.Throws<WorkflowException>(() => workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = false })));
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+        workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+        workflow.Save(Input(DraftInput()));
+
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 2 })));
+
+        Assert.Equal(0, handler.Calls);
+        Assert.Equal(0, agent.Calls);
+        Assert.Null(workflow.Snapshot().Run);
+    }
+
+    [Fact]
+    public async Task GivenDeadlineDuringBacklogImport_WhenKickingOff_BlocksConcurrentWorkAndExpiresBeforePo()
+    {
+        var handler = new PendingIssueHandler();
+        var workflow = new Workflow(Path.Combine(directory, "kickoff.json"), agent, new HttpClient(handler));
+        var input = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(Input(DraftInput()).GetRawText())!;
+        input["deadline"] = Input(DateTimeOffset.UtcNow.AddSeconds(1));
+        workflow.Save(Input(input));
+        workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+        var kickoff = workflow.TriageAsync(Input(new { revision = 1 }));
+        await handler.Entered.Task;
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.TriageAsync(Input(new { revision = 1 })));
+        await Assert.ThrowsAsync<WorkflowException>(() => workflow.ImportAsync(CancellationToken.None));
+        Assert.Throws<WorkflowException>(() => workflow.Save(Input(DraftInput())));
+        Assert.Throws<WorkflowException>(() => workflow.New(default));
+
+        await Assert.ThrowsAsync<WorkflowException>(() => kickoff);
+
+        Assert.Equal("expired", workflow.Snapshot().Run!.Status);
+        Assert.Equal("not-started", workflow.Snapshot().Run!.Usage);
+        Assert.Equal(0, agent.Calls);
+        Assert.Equal("manual-1", Assert.Single(workflow.Snapshot().Draft!.Candidates).Id);
+        Assert.Null(workflow.Snapshot().Proposal);
     }
 
     [Fact]
@@ -366,6 +523,138 @@ public sealed class WorkflowTests : IDisposable
     }
 
     [Fact]
+    public async Task GivenPaginatedBacklog_WhenImporting_RetainsEveryIssueAndManualItemWithoutSelection()
+    {
+        var firstPage = Issues(1, 100);
+        firstPage[0]["pull_request"] = new { url = "https://api.github.com/repos/team/product/pulls/1" };
+        firstPage[1]["labels"] = new[] { new { name = "story" }, new { name = "TRIAGED" } };
+        firstPage[1]["milestone"] = new { number = 7 };
+        var handler = new ResponsesHandler(JsonSerializer.Serialize(firstPage), JsonSerializer.Serialize(Issues(101, 35)), "[]");
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(DraftInput()));
+
+        var imported = await workflow.ImportAsync(CancellationToken.None);
+
+        Assert.Equal(135, imported.Draft!.Candidates.Count);
+        Assert.Single(imported.Draft.Candidates, item => item.Source == "manual");
+        Assert.Equal(Enumerable.Range(2, 134).Select(number => $"gh-{number}"),
+            imported.Draft.Candidates.Where(item => item.Source == "github").Select(item => item.Id));
+        Assert.True(imported.Draft.Candidates.Single(item => item.Id == "gh-2").Triaged);
+        Assert.Equal(7, imported.Draft.Candidates.Single(item => item.Id == "gh-2").MilestoneNumber);
+        Assert.Equal(133, imported.Draft.Candidates.Count(item => !item.Triaged));
+        var saved = workflow.Save(Input(new { repository = "team/product", deadline = imported.Draft.Deadline,
+            planningCredits = 2, candidates = imported.Draft.Candidates.Select(item => new
+            {
+                id = item.Id, kind = item.Kind, source = item.Source, title = item.Title, body = item.Body,
+                url = item.Url, triaged = item.Triaged, milestoneNumber = item.MilestoneNumber
+            }) }));
+        Assert.Equal(135, saved.Draft!.Candidates.Count);
+        Assert.Equal(135, new Workflow(Path.Combine(directory, "import.json"), agent).Snapshot().Draft!.Candidates.Count);
+        Assert.Equal(3, handler.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GivenFullPage_WhenImporting_ContinuesPastPullRequestsAndStopsAtEmptyPage(bool pullRequestsOnly)
+    {
+        var firstPage = Issues(1, 100);
+        if (pullRequestsOnly)
+            foreach (var issue in firstPage) issue["pull_request"] = new { url = "https://api.github.com/repos/team/product/pulls/1" };
+        var responses = new List<string> { JsonSerializer.Serialize(firstPage) };
+        if (pullRequestsOnly) responses.Add(JsonSerializer.Serialize(Issues(101, 100)));
+        responses.AddRange(["[]", "[]"]);
+        var handler = new ResponsesHandler(responses.ToArray());
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        workflow.SelectRepository(Input(new { repository = "team/product" }));
+
+        var imported = await workflow.ImportAsync(CancellationToken.None);
+
+        Assert.Equal(Enumerable.Range(pullRequestsOnly ? 101 : 1, 100).Select(number => $"gh-{number}"),
+            imported.Draft!.Candidates.Select(item => item.Id));
+        var pageCount = pullRequestsOnly ? 3 : 2;
+        Assert.Equal(Enumerable.Range(1, pageCount).Select(page => $"/repos/team/product/issues?state=open&per_page=100&page={page}"),
+            handler.Requests.Take(pageCount));
+        Assert.Equal("/repos/team/product/milestones?state=open&per_page=100", handler.Requests.Last());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GivenLaterPageFailure_WhenImporting_PreservesAuthorizedDraft(bool httpFailure)
+    {
+        var handler = new ResponsesHandler(JsonSerializer.Serialize(Issues(1, 100)), "{}")
+        {
+            FailedCall = httpFailure ? 2 : null
+        };
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        workflow.Save(Input(DraftInput()));
+        var before = workflow.Authorize(Input(new { revision = 1, acknowledgeSoftCap = true }));
+
+        var error = await Assert.ThrowsAsync<WorkflowException>(() => workflow.ImportAsync(CancellationToken.None));
+
+        Assert.Equal(502, error.Status);
+        Assert.Equal(JsonSerializer.Serialize(before), JsonSerializer.Serialize(workflow.Snapshot()));
+        Assert.Equal(JsonSerializer.Serialize(before),
+            JsonSerializer.Serialize(new Workflow(Path.Combine(directory, "import.json"), agent).Snapshot()));
+        Assert.Equal(2, handler.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GivenPendingLaterPage_WhenKickoffChangesOrCancels_DoesNotPublishIssues(bool cancel)
+    {
+        var handler = new PendingIssueHandler(JsonSerializer.Serialize(Issues(1, 100)));
+        var workflow = new Workflow(Path.Combine(directory, "import.json"), agent, new HttpClient(handler));
+        var before = workflow.Save(Input(DraftInput()));
+        using var cancellation = new CancellationTokenSource();
+        var import = workflow.ImportAsync(cancellation.Token);
+        await handler.Entered.Task;
+
+        if (cancel)
+        {
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => import);
+        }
+        else
+        {
+            workflow.New(default);
+            before = workflow.Save(Input(DraftInput("Changed objective")));
+            handler.Release.SetResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(Issues(101, 1)), System.Text.Encoding.UTF8, "application/json")
+            });
+            var error = await Assert.ThrowsAsync<WorkflowException>(() => import);
+            Assert.Equal(409, error.Status);
+        }
+
+        Assert.Equal(JsonSerializer.Serialize(before), JsonSerializer.Serialize(workflow.Snapshot()));
+        Assert.DoesNotContain(workflow.Snapshot().Draft!.Candidates, item => item.Source == "github");
+    }
+
+    [Fact]
+    public void GivenManyUntriagedStories_WhenValidating_AcceptsAllStoryQuestions()
+    {
+        var candidates = Enumerable.Range(1, 135).Select(number => new Candidate($"gh-{number}", "story", "github",
+            $"Story {number}", "Context", null, false, null)).ToList();
+        var raw = JsonSerializer.Serialize(new
+        {
+            ranked = Array.Empty<object>(),
+            storyQuestions = candidates.Select(item => new { id = item.Id, question = "What are the acceptance criteria?" }),
+            assignments = Array.Empty<string>()
+        });
+
+        var proposal = Workflow.ValidateProposal(raw, candidates);
+
+        Assert.NotNull(proposal.StoryQuestions);
+        Assert.NotNull(proposal.Assignments);
+        Assert.Equal(135, proposal.StoryQuestions.Count);
+        Assert.Empty(proposal.Ranked);
+        Assert.Empty(proposal.Assignments);
+    }
+
+    [Fact]
     public async Task GivenRepositoryOnly_WhenImporting_PreservesTriageAndFindsNextMilestone()
     {
         var handler = new ResponsesHandler(
@@ -456,9 +745,9 @@ public sealed class WorkflowTests : IDisposable
 
     private async Task<Workflow> PreparedAssignmentAsync(FakeIssueWriter writer)
     {
-        var handler = new ResponsesHandler(
-            """[{"number":1,"title":"Story A","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null},{"number":2,"title":"Story B","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null}]""",
-            """[{"number":5,"title":"Next","due_on":null}]""");
+        var issues = """[{"number":1,"title":"Story A","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null},{"number":2,"title":"Story B","body":"","labels":[{"name":"story"},{"name":"triaged"}],"milestone":null}]""";
+        var milestones = """[{"number":5,"title":"Next","due_on":null}]""";
+        var handler = new ResponsesHandler(issues, milestones, issues, milestones);
         var workflow = new Workflow(Path.Combine(directory, "apply.json"), agent, new HttpClient(handler), writer);
         workflow.SelectRepository(Input(new { repository = "team/product" }));
         await workflow.ImportAsync(CancellationToken.None);
@@ -482,13 +771,19 @@ public sealed class WorkflowTests : IDisposable
         }
     }
 
-    private sealed class PendingIssueHandler : HttpMessageHandler
+    private sealed class PendingIssueHandler(params string[] precedingResponses) : HttpMessageHandler
     {
+        private int calls;
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<HttpResponseMessage> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            if (calls++ < precedingResponses.Length)
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(precedingResponses[calls - 1], System.Text.Encoding.UTF8, "application/json")
+                };
             Entered.SetResult();
             return await Release.Task.WaitAsync(cancellationToken);
         }
@@ -497,12 +792,16 @@ public sealed class WorkflowTests : IDisposable
     private sealed class ResponsesHandler(params string[] responses) : HttpMessageHandler
     {
         public int Calls { get; private set; }
+        public int? FailedCall { get; init; }
+        public List<string> Requests { get; } = [];
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            Requests.Add(request.RequestUri!.PathAndQuery);
+            Calls++;
+            return Task.FromResult(new HttpResponseMessage(Calls == FailedCall ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
             {
-                Content = new StringContent(responses[Calls++], System.Text.Encoding.UTF8, "application/json")
+                Content = new StringContent(responses[Calls - 1], System.Text.Encoding.UTF8, "application/json")
             });
         }
     }

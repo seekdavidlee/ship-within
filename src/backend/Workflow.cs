@@ -167,43 +167,51 @@ public sealed class Workflow
     }
 
     /// <summary>Imports public issues and open milestones for the selected repository.</summary>
-    public async Task<WorkspaceState> ImportAsync(CancellationToken cancellation)
+    public Task<WorkspaceState> ImportAsync(CancellationToken cancellation) => ImportAsync(cancellation, false);
+
+    private async Task<WorkspaceState> ImportAsync(CancellationToken cancellation, bool forPlanningRun)
     {
         Draft? original;
         string repository;
+        bool ImportBlocked() => forPlanningRun ? !active || state.Run?.Status != "running" : state.Run is not null || active;
         lock (gate)
         {
-            if (state.Repository is null || state.Run is not null || active) throw new WorkflowException("Choose a repository before importing issues.", 409);
+            if (state.Repository is null || ImportBlocked()) throw new WorkflowException("Choose a repository before importing issues.", 409);
             original = state.Draft;
             repository = state.Repository;
         }
         var parts = repository.Split('/');
         var apiRoot = $"https://api.github.com/repos/{Uri.EscapeDataString(parts[0])}/{Uri.EscapeDataString(parts[1])}";
-        using var request = new HttpRequestMessage(HttpMethod.Get,
-            $"{apiRoot}/issues?state=open&per_page=100");
-        request.Headers.Add("User-Agent", "ship-within-local");
-        request.Headers.Add("Accept", "application/vnd.github+json");
-        using var response = await http.SendAsync(request, cancellation);
-        if (!response.IsSuccessStatusCode) throw new WorkflowException($"Public issue import failed (GitHub HTTP {(int)response.StatusCode}). Private repositories require manual input.", 502);
-        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation));
-        if (document.RootElement.ValueKind != JsonValueKind.Array) throw new WorkflowException("Unexpected GitHub issue response.", 502);
-        var issues = document.RootElement.EnumerateArray().Where(item => !item.TryGetProperty("pull_request", out _)).Take(30).Select(item =>
+        var issues = new List<Candidate>();
+        for (var page = 1; ; page++)
         {
-            var labels = Value(item, "labels");
-            var names = labels.ValueKind == JsonValueKind.Array ? labels.EnumerateArray().Select(label => Value(label, "name").ToString()).ToList() : [];
-            var kind = names.Any(name => Regex.IsMatch(name, @"^(story|user.story)$", RegexOptions.IgnoreCase)) ? "story"
-                : names.Any(name => Regex.IsMatch(name, "bug|defect", RegexOptions.IgnoreCase)) ? "defect"
-                : names.Any(name => Regex.IsMatch(name, "feature|enhancement", RegexOptions.IgnoreCase)) ? "feature" : "unclassified";
-            var milestone = Value(item, "milestone");
-            return new Candidate("gh-" + Value(item, "number"), kind, "github", Value(item, "title").ToString(),
-                Value(item, "body").ToString(), Value(item, "html_url").ToString(),
-                names.Any(name => string.Equals(name, "triaged", StringComparison.OrdinalIgnoreCase)),
-                milestone.ValueKind == JsonValueKind.Object ? Value(milestone, "number").GetInt32() : null);
-        }).ToList();
-        lock (gate)
-        {
-            if (state.Run is not null || active || !ReferenceEquals(state.Draft, original) || state.Repository != repository)
-                throw new WorkflowException("Repository or issue revision changed during import. Review the current revision.", 409);
+            using var request = new HttpRequestMessage(HttpMethod.Get,
+                $"{apiRoot}/issues?state=open&per_page=100&page={page}");
+            request.Headers.Add("User-Agent", "ship-within-local");
+            request.Headers.Add("Accept", "application/vnd.github+json");
+            using var response = await http.SendAsync(request, cancellation);
+            if (!response.IsSuccessStatusCode) throw new WorkflowException($"Public issue import failed (GitHub HTTP {(int)response.StatusCode}). Private repositories require manual input.", 502);
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation));
+            if (document.RootElement.ValueKind != JsonValueKind.Array) throw new WorkflowException("Unexpected GitHub issue response.", 502);
+            issues.AddRange(document.RootElement.EnumerateArray().Where(item => !item.TryGetProperty("pull_request", out _)).Select(item =>
+            {
+                var labels = Value(item, "labels");
+                var names = labels.ValueKind == JsonValueKind.Array ? labels.EnumerateArray().Select(label => Value(label, "name").ToString()).ToList() : [];
+                var kind = names.Any(name => Regex.IsMatch(name, @"^(story|user.story)$", RegexOptions.IgnoreCase)) ? "story"
+                    : names.Any(name => Regex.IsMatch(name, "bug|defect", RegexOptions.IgnoreCase)) ? "defect"
+                    : names.Any(name => Regex.IsMatch(name, "feature|enhancement", RegexOptions.IgnoreCase)) ? "feature" : "unclassified";
+                var milestone = Value(item, "milestone");
+                return new Candidate("gh-" + Value(item, "number"), kind, "github", Value(item, "title").ToString(),
+                    Value(item, "body").ToString(), Value(item, "html_url").ToString(),
+                    names.Any(name => string.Equals(name, "triaged", StringComparison.OrdinalIgnoreCase)),
+                    milestone.ValueKind == JsonValueKind.Object ? Value(milestone, "number").GetInt32() : null);
+            }));
+            lock (gate)
+            {
+                if (ImportBlocked() || !ReferenceEquals(state.Draft, original) || state.Repository != repository)
+                    throw new WorkflowException("Repository or issue revision changed during import. Review the current revision.", 409);
+            }
+            if (document.RootElement.GetArrayLength() < 100) break;
         }
         using var milestonesRequest = new HttpRequestMessage(HttpMethod.Get, $"{apiRoot}/milestones?state=open&per_page=100");
         milestonesRequest.Headers.Add("User-Agent", "ship-within-local");
@@ -218,12 +226,13 @@ public sealed class Workflow
             .OrderBy(item => item.DueOn ?? DateTimeOffset.MaxValue).ThenBy(item => item.Number).FirstOrDefault();
         lock (gate)
         {
-            if (state.Run is not null || active || !ReferenceEquals(state.Draft, original) || state.Repository != repository)
+            if (ImportBlocked() || !ReferenceEquals(state.Draft, original) || state.Repository != repository)
                 throw new WorkflowException("Repository or issue revision changed during import. Review the current revision.", 409);
-            var combined = (original?.Candidates.Where(item => item.Source != "github") ?? []).Concat(issues).Take(30).ToList();
+            cancellation.ThrowIfCancellationRequested();
+            var combined = (original?.Candidates.Where(item => item.Source != "github") ?? []).Concat(issues).ToList();
             var validated = ValidateCandidates(JsonSerializer.SerializeToElement(combined, JsonOptions));
             var draft = original is null ? new Draft(repository, "", "", DateTimeOffset.UtcNow.AddDays(1), 2,
-                state.AgentModels!["productOwner"], validated, 1) : original with { Candidates = validated, Revision = original.Revision + 1 };
+                state.AgentModels!["productOwner"], validated, 1) : original with { Candidates = validated, Revision = original.Revision + (forPlanningRun ? 0 : 1) };
             state = state with { Draft = draft, AuthorizedRevision = null, Proposal = null, NextMilestone = nextMilestone };
             Persist();
             return Clone();
@@ -238,7 +247,6 @@ public sealed class Workflow
             if (state.History.Any(entry => Unreconciled(entry.Run))) throw new WorkflowException("Reconcile prior unknown usage before authorizing another attempt.", 409);
             if (state.Draft is null || state.Run is not null || active || Value(input, "revision").ToString() != state.Draft.Revision.ToString())
                 throw new WorkflowException("Save and review the current revision first.", 409);
-            if (state.Draft.Candidates.Count == 0) throw new WorkflowException("Import or add an issue before authorizing a run.");
             if (state.Draft.Deadline <= DateTimeOffset.UtcNow) throw new WorkflowException("Deadline has expired.", 409);
             if (Value(input, "acknowledgeSoftCap").ValueKind != JsonValueKind.True)
                 throw new WorkflowException("Acknowledge that the AI Credits soft cap can overshoot.");
@@ -260,7 +268,7 @@ public sealed class Workflow
             draft = state.Draft;
             if (draft.Deadline <= DateTimeOffset.UtcNow) throw new WorkflowException("Deadline has expired.", 409);
             active = true;
-            state = state with { AuthorizedRevision = null, Run = new PlanningRun("running", DateTimeOffset.UtcNow, draft.Revision, draft.PlanningCredits, "unknown") };
+            state = state with { AuthorizedRevision = null, Run = new PlanningRun("running", DateTimeOffset.UtcNow, draft.Revision, draft.PlanningCredits, "not-started", "Importing the repository backlog.") };
             Persist();
         }
         var remaining = draft.Deadline - DateTimeOffset.UtcNow;
@@ -271,17 +279,28 @@ public sealed class Workflow
             {
                 if (state.Run?.Status == "running")
                 {
-                    state = state with { Run = state.Run with { Status = "stopping", Message = "Deadline reached; cancellation requested. Charges may already have occurred." } };
+                    state = state with { Run = state.Run with { Status = "stopping", Message = state.Run.Usage == "not-started"
+                        ? "Deadline reached during backlog import; cancellation requested."
+                        : "Deadline reached; cancellation requested. Charges may already have occurred." } };
                     Persist();
                 }
             }
         });
         try
         {
-            var raw = await agent.RunAsync(draft, state.NextMilestone, deadline.Token).WaitAsync(deadline.Token);
+            var imported = await ImportAsync(deadline.Token, true);
+            draft = imported.Draft!;
+            if (draft.Candidates.Count == 0) throw new WorkflowException("No open issues are available for Product Owner review.");
+            deadline.Token.ThrowIfCancellationRequested();
+            lock (gate)
+            {
+                state = state with { Run = state.Run! with { Usage = "unknown", Message = "Product Owner planning is underway." } };
+                Persist();
+            }
+            var raw = await agent.RunAsync(draft, imported.NextMilestone, deadline.Token).WaitAsync(deadline.Token);
             if (deadline.IsCancellationRequested || DateTimeOffset.UtcNow >= draft.Deadline)
                 throw new WorkflowException("Late response was discarded.", 409);
-            var proposal = ValidateProposal(raw, draft.Candidates, state.NextMilestone);
+            var proposal = ValidateProposal(raw, draft.Candidates, imported.NextMilestone);
             lock (gate)
             {
                 state = state with { Proposal = proposal, Run = state.Run! with { Status = "completed", Message = "Draft proposal ready for human review. Usage has not been reconciled." } };
@@ -403,7 +422,7 @@ public sealed class Workflow
         var stories = candidates.Where(item => item.Kind == "story").Select(item => item.Id).ToHashSet();
         var assignableStories = candidates.Where(item => item.Kind == "story" && item.Triaged && item.Source == "github").ToDictionary(item => item.Id);
         if (proposal?.Ranked is null || proposal.StoryQuestions is null || proposal.Assignments is null ||
-            proposal.Ranked.Count != triaged.Count || proposal.StoryQuestions.Count > 30 ||
+            proposal.Ranked.Count != triaged.Count ||
             proposal.StoryQuestions.Any(item => item is null || string.IsNullOrWhiteSpace(item.Id) || !stories.Contains(item.Id) || string.IsNullOrWhiteSpace(item.Question) || item.Question.Length > 300))
             throw new WorkflowException("The proposal omitted triaged issues or story questions are invalid.", 502);
         if (proposal.Ranked.Any(item => item is null || !triaged.Contains(item.Id) || string.IsNullOrWhiteSpace(item.Reason) || item.Reason.Length > 600) ||
@@ -440,7 +459,7 @@ public sealed class Workflow
 
     private static List<Candidate> ValidateCandidates(JsonElement input)
     {
-        if (input.ValueKind != JsonValueKind.Array || input.GetArrayLength() > 30) throw new WorkflowException("Provide no more than 30 candidates.");
+        if (input.ValueKind != JsonValueKind.Array) throw new WorkflowException("Provide candidates as an array.");
         var candidates = input.EnumerateArray().Select((item, index) =>
         {
             if (item.ValueKind != JsonValueKind.Object) throw new WorkflowException("Invalid candidate.");

@@ -3,7 +3,6 @@ using ShipWithin.Api;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://127.0.0.1:{Environment.GetEnvironmentVariable("SHIP_WITHIN_API_PORT") ?? "4174"}");
-builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 18000);
 var productOwner = new CopilotProductOwner(Path.Combine(Directory.GetCurrentDirectory(), "data", "copilot-home"));
 builder.Services.AddSingleton(productOwner);
 builder.Services.AddSingleton(new Workflow(
